@@ -5,6 +5,13 @@ import re
 import pydot
 import codecs
 
+# TODO:
+# - parse sequences
+# - group courses by major
+# - make sure equivalents are being handled correctly
+# - include descriptions somehow
+# etc...
+
 def read_url(url):
   f = urllib.urlopen(url)
   return f.read()
@@ -29,6 +36,7 @@ def get_courses(url):
   for course_elem in course_elems:
     title_text = course_elem.find('p', {'class':'courseblocktitle'}).strong.text
     elems = [s.strip() for s in title_text.split('.')]
+    # TODO: parse sequences
     try:
       (code, title, credit, _) = elems
     except ValueError:
@@ -36,19 +44,18 @@ def get_courses(url):
       continue
     details = course_elem.find('p', {'class': 'courseblockdetail'})
     texts = [x.strip() for x in details.contents if x.__class__ == NavigableString]
-    prereqs = None
+    prereq_codes = []
+    prereq_text = None
     notes = None
-    equivs = None
+    equivs = []
     for text in texts:
       # scrape rereqs
       m = re.search(r'Prerequisite\(s\): (.*)', text)
       if m:
         prereq_text = m.group(1)
         res = re.findall(r'([A-Z]{4} [0-9]{5})+', prereq_text)
-        if len(res) > 0:
-          prereqs = res
-        else:
-          prereqs = prereq_text
+        if res:
+          prereq_codes = res
       # scrape note
       m = re.search(r'Note\(s\): (.*)', text)
       if m:
@@ -57,7 +64,14 @@ def get_courses(url):
       m = re.findall(r'Equivalent Course\(s\): ([A-Z]{4} [0-9]{5})', text)
       if len(m) > 0:
         equivs = m
-    course = {'code': code.replace('&#160;', ' '), 'title': title, 'prereqs': prereqs, 'notes': notes, 'equivs': equivs}
+    course = {
+      'code': code.replace('&#160;', ' '),
+      'title': title,
+      'prereq_codes': prereq_codes,
+      'prereq_text': prereq_text,
+      'notes': notes,
+      'equivs': equivs
+    }
     courses[title] = course
   return courses
 
@@ -69,43 +83,6 @@ def get_all_courses():
     all_courses[major] = get_courses(url)
   return all_courses
 
-def write_courses(courses):
-  f = open('courses.py', 'w')
-  f.write(str(courses))
-  f.close()
-
-def read_courses():
-  f = open('courses.py')
-  return eval(f.read())
-
-# Map[Major, Map[Course title, Course dict]] -> Map[Course title, course dict w/ multiple codes]
-def resolve_equivalents(courses):
-  by_code = {} # Map[course id, course dict]
-  for major, courses_dict in courses.iteritems():
-    for title, course_dict in courses_dict.iteritems():
-      by_code[course_dict['code']] = course_dict
-  by_title = {}
-  for major, courses_dict in courses.iteritems():
-    for title, course_dict in courses_dict.iteritems():
-      if title not in by_title:
-        by_title[title] = course_dict
-        prereqs_by_title = []
-        if type(course_dict['prereqs']) == list:
-          for code in course_dict['prereqs']:
-            try:
-              title = by_code[code]['title']
-              prereqs_by_title.append(title)
-            except KeyError:
-              trace('NOT FOUND: %s' % code)
-          del course_dict['prereqs']
-          course_dict['prereqs'] = prereqs_by_title
-        code = course_dict['code']
-        course_dict['codes'] = [code]
-        del course_dict['code']
-      else:
-        by_title[title]['codes'].append(course_dict['code'])
-  return by_title
-
 def get_all_courses_cached():
   courses = None
   try:
@@ -115,28 +92,101 @@ def get_all_courses_cached():
     write_courses(courses)
   return courses
 
+def write_courses(courses):
+  f = open('courses.py', 'w')
+  f.write(str(courses))
+  f.close()
+
+def read_courses():
+  f = open('courses.py')
+  return eval(f.read())
+
+def build_datastructure(all_courses):
+  majors = {} # code -> major struct
+  courses = {} # title -> course struct
+  for major, courses_dict in all_courses.iteritems():
+    for title, course_dict in courses_dict.iteritems():
+      # create major if doesn't exist
+      major_code = course_dict['code'][:4]
+      major_struct = None
+      if major_code not in majors:
+        major_struct = {
+          'name': major,
+          'code': major_code,
+          'courses': {}
+        }
+        majors[major_code] = major_struct
+      else:
+        major_struct = majors[major_code]
+      # create course struct if DNE
+      course_struct = None
+      if title not in courses:
+        course_struct = {
+          'title': title,
+          'notes': course_dict['notes'],
+          'prereq_codes': course_dict['prereq_codes'],
+          'prereq_text': course_dict['prereq_text'],
+          'desc': None,
+          'major_codes': []
+        }
+        courses[title] = course_struct
+      else:
+        course_struct = courses[title]
+      course_number = course_dict['code'][-5:]
+      # link course with major
+      has_code_struct = {
+        'major': major_struct,
+        'course': course_struct,
+        'code': course_number,
+      }
+      course_struct['major_codes'].append(has_code_struct)
+      majors[major_code]['courses'][course_number] = has_code_struct
+  # TODO: handing equivalents correctly? do equivalent courses always have the same name?
+  # link prereqs
+  serialnum = 0
+  for title, course_struct in courses.iteritems():
+    course_struct['prereqs'] = []
+    course_struct['serialnum'] = serialnum
+    serialnum += 1
+    for prereq in course_struct['prereq_codes']:
+      major_code = prereq[:4]
+      number = prereq[-5:]
+      try:
+        prereq_course = majors[major_code]['courses'][number]['course']
+        if prereq_course not in course_struct['prereqs'] and prereq_course is not course_struct:
+          course_struct['prereqs'].append(prereq_course)
+      except KeyError:
+        trace('missing prereq: %s %s' % (major_code, number))
+    #del course_struct['prereq_codes']
+  return (majors, courses)
+
 # Map[Course title, course dict w/ multiple codes] -> pydot.Graph
 def build_graph(courses):
   g = pydot.Graph('courses', graph_type='digraph')
-  i = 0
-  title_to_id = {}
+  def get_node_name(course):
+    return 'node_%d' % course['serialnum']
+  
   for title, course in courses.iteritems():
-    course_id = 'node' + str(i)
-    i += 1
-    course['node_id'] = course_id
-    title_to_id[course['title']] = course_id
-    g.add_node(pydot.Node(course_id, label=title))
-  for title, course in courses.iteritems():
-      if course['prereqs']:
-        if type(course['prereqs']) == list:
-          for prereq in course['prereqs']:
-            g.add_edge(pydot.Edge(title_to_id[course['title']], title_to_id[prereq]))
-        else:
-          trace('prereqs are wrong: %s' % course['prereqs'])
+    names = []
+    for has_code in course['major_codes']:
+      major_code = has_code['major']['code']
+      course_number = has_code['code']
+      names.append('%s %s' % (major_code, course_number))
+    codes = '/'.join(names)
+    #codes = [has_code['major']['code'] + ' ' + has_code['code'] for has_code in course['major_codes']].join('/')
+    g.add_node(pydot.Node(
+      get_node_name(course),
+      label='%s: %s' % (codes, course['title']),
+      tooltip=course['prereq_text']
+    ))
+    for prereq in course['prereqs']:
+      g.add_edge(pydot.Edge(get_node_name(course), get_node_name(prereq)))
   return g
 
 if __name__ == '__main__':
-  dot = build_graph(resolve_equivalents(get_all_courses_cached())).to_string()
+  raw_courses = get_all_courses_cached()
+  majors, courses = build_datastructure(raw_courses)
+  graph = build_graph(courses)
   f = codecs.open('classdepgraph.dot', 'w', encoding='utf-8')
-  f.write(dot)
+  f.write(graph.to_string())
   f.close()
